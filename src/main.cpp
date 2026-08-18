@@ -17,6 +17,7 @@
 extern "C" {
 #include "ukfe_rf.h"
 }
+#include "wifi_attack.h"   // native WiFi-Angriffe (Deauth/Beacon/Scan), nicht-blockierend
 
 USBHIDKeyboard Keyboard;   // natives S3-USB als HID-Tastatur
 TFT_eSPI tft = TFT_eSPI(); // Status-Display (visuelle Bestaetigung ohne Serial)
@@ -114,9 +115,37 @@ void act(const UkfeRfMessage* m) {
         Serial.printf("HID getippt: idx=%u (%s)\n", idx, pn);
         break;
     }
-    case UkfeRfCmdWifiDeauth:  Serial.println("CMD WIFI DEAUTH (TODO: Marauder-Bridge)"); break;
-    case UkfeRfCmdEvilPortal:  Serial.println("CMD EVIL PORTAL (TODO)"); break;
-    case UkfeRfCmdBeaconSpam:  Serial.println("CMD BEACON SPAM (TODO)"); break;
+    case UkfeRfCmdWifiScan: {
+        uint8_t n = wifi_attack_scan();           // blockierend ~2 s, danach ESP-NOW-Kanal zurueck
+        Serial.printf("WIFI SCAN: %u APs\n", n);
+        char l2[24]; snprintf(l2, sizeof(l2), "%u APs", n);
+        tft_show("WIFI SCAN", l2, "siehe Serial", TFT_CYAN);
+        break;
+    }
+    case UkfeRfCmdWifiDeauth: {
+        // args: uint8 bssid[6], uint8 channel (0=hoppen). ACHTUNG: kein 868-Backchannel ->
+        // Stop erreicht die LilyGo erst nach dem 20-s-Sicherheits-Timeout (Kanal gewechselt).
+        if(m->arg_len >= 6) {
+            uint8_t ch = (m->arg_len >= 7) ? m->args[6] : 0;
+            wifi_attack_deauth(m->args, ch, 0);
+            Serial.printf("WIFI DEAUTH ch=%u %02X:%02X:%02X..\n", ch, m->args[0], m->args[1], m->args[2]);
+            tft_show("WIFI DEAUTH", "laeuft (max20s)", "kein Stop-Kanal", TFT_RED);
+        } else { Serial.println("WIFI DEAUTH: bssid fehlt"); }
+        break;
+    }
+    case UkfeRfCmdWifiStop:
+        wifi_attack_stop();
+        Serial.println("WIFI STOP");
+        tft_show("WIFI STOP", "Angriff beendet", "", TFT_GREEN);
+        break;
+    case UkfeRfCmdBeaconSpam: {
+        uint8_t mode = m->arg_len ? m->args[0] : 0;
+        wifi_attack_beacon(mode, 0);
+        Serial.println("BEACON SPAM laeuft (max20s)");
+        tft_show("BEACON SPAM", "laeuft (max20s)", "kein Stop-Kanal", TFT_YELLOW);
+        break;
+    }
+    case UkfeRfCmdEvilPortal:  Serial.println("CMD EVIL PORTAL (noch nicht impl.)"); break;
     default: Serial.printf("CMD 0x%02X alen=%u\n", m->cmd, m->arg_len); break;
     }
 }
@@ -138,6 +167,7 @@ void setup() {
     if(ok) esp_now_register_recv_cb(onEspNowRecv);
     // Hinweis: esp_wifi_set_ps() NICHT vor esp_now_init aufrufen -> crasht S3
     // (USB-Drop/schwarzes TFT). Power-Save-Handling später sicher nachrüsten.
+    wifi_attack_init(ESPNOW_CHANNEL);   // Kanal zum Wiederherstellen nach Angriffen
 
     Serial.printf("\nG4MEOVER LilyGo UKFE-RX bereit. ESP-NOW(Kanal %d, %s) + USB-HID.\n",
                   ESPNOW_CHANNEL, ok ? "an" : "AUS");
@@ -149,7 +179,8 @@ void setup() {
 }
 
 void loop() {
-    if(!enowFlag) { delay(2); return; }
+    wifi_attack_tick();   // laufenden WiFi-Angriff bedienen (ein Burst pro Iteration)
+    if(!enowFlag) { if(!wifi_attack_busy()) delay(2); return; }
     int len = enowLen;
     uint8_t frame[UKFE_RF_MAX_FRAME];
     memcpy(frame, enowBuf, len);
