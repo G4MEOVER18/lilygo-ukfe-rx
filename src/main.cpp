@@ -18,6 +18,7 @@ extern "C" {
 #include "ukfe_rf.h"
 }
 #include "wifi_attack.h"   // native WiFi-Angriffe (Deauth/Beacon/Scan), nicht-blockierend
+#include "ble_spam.h"      // BLE-Spam (Apple/Windows/Android) + BLE-Scan via NimBLE
 
 USBHIDKeyboard Keyboard;   // natives S3-USB als HID-Tastatur
 TFT_eSPI tft = TFT_eSPI(); // Status-Display (visuelle Bestaetigung ohne Serial)
@@ -146,6 +147,29 @@ void act(const UkfeRfMessage* m) {
         break;
     }
     case UkfeRfCmdEvilPortal:  Serial.println("CMD EVIL PORTAL (noch nicht impl.)"); break;
+    case UkfeRfCmdBleScan: {
+        uint8_t n = ble_scan(m->arg_len ? (uint32_t)m->args[0] * 1000 : 3000);
+        Serial.printf("BLE SCAN: %u Geraete\n", n);
+        char l2[24]; snprintf(l2, sizeof(l2), "%u Geraete", n);
+        tft_show("BLE SCAN", l2, "siehe Serial", TFT_CYAN);
+        break;
+    }
+    case UkfeRfCmdBleSpam: {
+        uint8_t mode = m->arg_len ? m->args[0] : 0;
+        ble_spam_start(mode);                     // BLE koexistiert mit ESP-NOW -> Abort erreicht uns
+        Serial.println("BLE SPAM laeuft");
+        tft_show("BLE SPAM", "laeuft", "Abort=stop", TFT_YELLOW);
+        break;
+    }
+    case UkfeRfCmdSourApple:
+        ble_spam_start(1);                        // Apple-only Proximity-Spam
+        tft_show("SOUR APPLE", "Apple-Spam", "Abort=stop", TFT_YELLOW);
+        break;
+    case UkfeRfCmdBleSniff:  Serial.println("BLE SNIFF (noch nicht impl.)"); break;
+    case UkfeRfCmdAbort:
+        ble_spam_stop();
+        tft_show("ABORT", "BLE-Spam gestoppt", "", TFT_GREEN);
+        break;
     default: Serial.printf("CMD 0x%02X alen=%u\n", m->cmd, m->arg_len); break;
     }
 }
@@ -179,8 +203,9 @@ void setup() {
 }
 
 void loop() {
-    wifi_attack_tick();   // laufenden WiFi-Angriff bedienen (ein Burst pro Iteration)
-    if(!enowFlag) { if(!wifi_attack_busy()) delay(2); return; }
+    wifi_attack_tick();   // laufenden WiFi-Angriff bedienen
+    ble_spam_tick();      // laufenden BLE-Spam bedienen
+    if(!enowFlag) { if(!wifi_attack_busy() && !ble_spam_active()) delay(2); return; }
     int len = enowLen;
     uint8_t frame[UKFE_RF_MAX_FRAME];
     memcpy(frame, enowBuf, len);
