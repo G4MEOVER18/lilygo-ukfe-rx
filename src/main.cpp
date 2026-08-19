@@ -188,7 +188,16 @@ void setup() {
     WiFi.disconnect();
     esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
     bool ok = (esp_now_init() == ESP_OK);
-    if(ok) esp_now_register_recv_cb(onEspNowRecv);
+    if(ok) {
+        esp_now_register_recv_cb(onEspNowRecv);
+        // Broadcast-Peer registrieren — auf ESP32-S3 noetig, damit Broadcast-Frames
+        // (der Hub funkt an FF:FF:..) ueberhaupt empfangen werden. Fehlte bisher -> Empfangs-Quirk.
+        const uint8_t BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        esp_now_peer_info_t bp = {};
+        memcpy(bp.peer_addr, BCAST, 6);
+        bp.channel = ESPNOW_CHANNEL; bp.encrypt = false;
+        esp_now_add_peer(&bp);
+    }
     // Hinweis: esp_wifi_set_ps() NICHT vor esp_now_init aufrufen -> crasht S3
     // (USB-Drop/schwarzes TFT). Power-Save-Handling später sicher nachrüsten.
     wifi_attack_init(ESPNOW_CHANNEL);   // Kanal zum Wiederherstellen nach Angriffen
