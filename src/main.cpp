@@ -19,6 +19,7 @@ extern "C" {
 }
 #include "wifi_attack.h"   // native WiFi-Angriffe (Deauth/Beacon/Scan), nicht-blockierend
 #include "ble_spam.h"      // BLE-Spam (Apple/Windows/Android) + BLE-Scan via NimBLE
+#include "ducky.h"         // DuckyScript-Interpreter (SD-Payloads vom Flipper, gestreamt)
 
 USBHIDKeyboard Keyboard;   // natives S3-USB als HID-Tastatur
 TFT_eSPI tft = TFT_eSPI(); // Status-Display (visuelle Bestaetigung ohne Serial)
@@ -37,10 +38,8 @@ static void tft_show(const char* l1, const char* l2, const char* l3, uint16_t co
 }
 
 // Gemeinsames Geheimnis — IDENTISCH mit RF_SECRET/UKFE_SECRET (out-of-band pairen!).
-static const uint8_t UKFE_SECRET[UKFE_RF_SECRET_LEN] = {
-    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-    0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
-};
+#include "secret.h"
+static const uint8_t UKFE_SECRET[UKFE_RF_SECRET_LEN] = UKFE_RF_SECRET_INIT;
 
 // ---- ESP-NOW-Empfang (Callback setzt nur Flag; HID/Delay laufen in loop) ----
 static volatile bool enowFlag = false;
@@ -106,6 +105,21 @@ static const char* hid_payload(uint8_t idx) {
     return PAYLOADS[idx].name;
 }
 
+// ---- Eingebaute DuckyScripts (0x51 HidDucky, per script_id). Nur autorisierte Tests. ----
+static const char* DUCKY_SCRIPTS[] = {
+    "REM G4MEOVER Marker\nGUI r\nDELAY 400\nSTRING notepad\nENTER\nDELAY 800\n"
+    "STRING G4MEOVER HID-Ducky online\nENTER",
+    "REM PowerShell Marker\nGUI r\nDELAY 400\nSTRING powershell\nENTER\nDELAY 1200\n"
+    "STRING Write-Host 'G4MEOVER pentest marker'\nENTER",
+    "REM Lock\nGUI l",
+};
+#define DUCKY_SCRIPT_COUNT (sizeof(DUCKY_SCRIPTS) / sizeof(DUCKY_SCRIPTS[0]))
+
+// ---- Gestreamter DuckyScript (0x52 HidStream): Chunks ueber viele Frames sammeln. ----
+static char     duckyStream[2048];
+static uint16_t duckyStreamLen = 0;
+static bool     duckyStreamOverflow = false;
+
 // ---- Befehls-Dispatcher (gleiche Handler-Semantik wie Heltec) ----
 void act(const UkfeRfMessage* m) {
     switch(m->cmd) {
@@ -166,6 +180,34 @@ void act(const UkfeRfMessage* m) {
         tft_show("SOUR APPLE", "Apple-Spam", "Abort=stop", TFT_YELLOW);
         break;
     case UkfeRfCmdBleSniff:  Serial.println("BLE SNIFF (noch nicht impl.)"); break;
+    case UkfeRfCmdHidDucky: {
+        uint8_t sid = m->arg_len ? m->args[0] : 0;
+        if(sid >= DUCKY_SCRIPT_COUNT) { tft_show("HID DUCKY", "id unbekannt", "", TFT_RED); break; }
+        tft_show("HID DUCKY", "laeuft", "-> HID tippt", TFT_YELLOW);
+        delay(300);                       // Host-Enumeration abwarten
+        ducky_run(Keyboard, DUCKY_SCRIPTS[sid]);
+        Serial.printf("HID Ducky id=%u getippt\n", sid);
+        break;
+    }
+    case UkfeRfCmdHidStream: {
+        uint8_t flags = m->arg_len ? m->args[0] : 0;
+        if(flags & 0x01) { duckyStreamLen = 0; duckyStreamOverflow = false; }  // first: reset
+        for(uint8_t i = 1; i < m->arg_len; i++) {
+            if(duckyStreamLen < sizeof(duckyStream) - 1) duckyStream[duckyStreamLen++] = (char)m->args[i];
+            else duckyStreamOverflow = true;
+        }
+        if(flags & 0x02) {                // last: tippen
+            duckyStream[duckyStreamLen] = 0;
+            tft_show("HID STREAM", duckyStreamOverflow ? "OVF -> tippt" : "-> HID tippt", "", TFT_YELLOW);
+            delay(300);
+            ducky_run(Keyboard, duckyStream);
+            Serial.printf("HID Stream getippt: %u B%s\n", duckyStreamLen, duckyStreamOverflow ? " (OVF)" : "");
+            duckyStreamLen = 0; duckyStreamOverflow = false;
+        } else {
+            Serial.printf("HID Stream gepuffert: %u B\n", duckyStreamLen);
+        }
+        break;
+    }
     case UkfeRfCmdAbort:
         ble_spam_stop();
         tft_show("ABORT", "BLE-Spam gestoppt", "", TFT_GREEN);
