@@ -17,6 +17,9 @@
 extern "C" {
 #include "ukfe_rf.h"
 }
+#include "wifi_attack.h"   // native WiFi-Angriffe (Deauth/Beacon/Scan), nicht-blockierend
+#include "ble_spam.h"      // BLE-Spam (Apple/Windows/Android) + BLE-Scan via NimBLE
+#include "ducky.h"         // DuckyScript-Interpreter (SD-Payloads vom Flipper, gestreamt)
 
 USBHIDKeyboard Keyboard;   // natives S3-USB als HID-Tastatur
 TFT_eSPI tft = TFT_eSPI(); // Status-Display (visuelle Bestaetigung ohne Serial)
@@ -35,10 +38,8 @@ static void tft_show(const char* l1, const char* l2, const char* l3, uint16_t co
 }
 
 // Gemeinsames Geheimnis — IDENTISCH mit RF_SECRET/UKFE_SECRET (out-of-band pairen!).
-static const uint8_t UKFE_SECRET[UKFE_RF_SECRET_LEN] = {
-    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-    0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
-};
+#include "secret.h"
+static const uint8_t UKFE_SECRET[UKFE_RF_SECRET_LEN] = UKFE_RF_SECRET_INIT;
 
 // ---- ESP-NOW-Empfang (Callback setzt nur Flag; HID/Delay laufen in loop) ----
 static volatile bool enowFlag = false;
@@ -104,6 +105,21 @@ static const char* hid_payload(uint8_t idx) {
     return PAYLOADS[idx].name;
 }
 
+// ---- Eingebaute DuckyScripts (0x51 HidDucky, per script_id). Nur autorisierte Tests. ----
+static const char* DUCKY_SCRIPTS[] = {
+    "REM G4MEOVER Marker\nGUI r\nDELAY 400\nSTRING notepad\nENTER\nDELAY 800\n"
+    "STRING G4MEOVER HID-Ducky online\nENTER",
+    "REM PowerShell Marker\nGUI r\nDELAY 400\nSTRING powershell\nENTER\nDELAY 1200\n"
+    "STRING Write-Host 'G4MEOVER pentest marker'\nENTER",
+    "REM Lock\nGUI l",
+};
+#define DUCKY_SCRIPT_COUNT (sizeof(DUCKY_SCRIPTS) / sizeof(DUCKY_SCRIPTS[0]))
+
+// ---- Gestreamter DuckyScript (0x52 HidStream): Chunks ueber viele Frames sammeln. ----
+static char     duckyStream[2048];
+static uint16_t duckyStreamLen = 0;
+static bool     duckyStreamOverflow = false;
+
 // ---- Befehls-Dispatcher (gleiche Handler-Semantik wie Heltec) ----
 void act(const UkfeRfMessage* m) {
     switch(m->cmd) {
@@ -114,9 +130,88 @@ void act(const UkfeRfMessage* m) {
         Serial.printf("HID getippt: idx=%u (%s)\n", idx, pn);
         break;
     }
-    case UkfeRfCmdWifiDeauth:  Serial.println("CMD WIFI DEAUTH (TODO: Marauder-Bridge)"); break;
-    case UkfeRfCmdEvilPortal:  Serial.println("CMD EVIL PORTAL (TODO)"); break;
-    case UkfeRfCmdBeaconSpam:  Serial.println("CMD BEACON SPAM (TODO)"); break;
+    case UkfeRfCmdWifiScan: {
+        uint8_t n = wifi_attack_scan();           // blockierend ~2 s, danach ESP-NOW-Kanal zurueck
+        Serial.printf("WIFI SCAN: %u APs\n", n);
+        char l2[24]; snprintf(l2, sizeof(l2), "%u APs", n);
+        tft_show("WIFI SCAN", l2, "siehe Serial", TFT_CYAN);
+        break;
+    }
+    case UkfeRfCmdWifiDeauth: {
+        // args: uint8 bssid[6], uint8 channel (0=hoppen). ACHTUNG: kein 868-Backchannel ->
+        // Stop erreicht die LilyGo erst nach dem 20-s-Sicherheits-Timeout (Kanal gewechselt).
+        if(m->arg_len >= 6) {
+            uint8_t ch = (m->arg_len >= 7) ? m->args[6] : 0;
+            wifi_attack_deauth(m->args, ch, 0);
+            Serial.printf("WIFI DEAUTH ch=%u %02X:%02X:%02X..\n", ch, m->args[0], m->args[1], m->args[2]);
+            tft_show("WIFI DEAUTH", "laeuft (max20s)", "kein Stop-Kanal", TFT_RED);
+        } else { Serial.println("WIFI DEAUTH: bssid fehlt"); }
+        break;
+    }
+    case UkfeRfCmdWifiStop:
+        wifi_attack_stop();
+        Serial.println("WIFI STOP");
+        tft_show("WIFI STOP", "Angriff beendet", "", TFT_GREEN);
+        break;
+    case UkfeRfCmdBeaconSpam: {
+        uint8_t mode = m->arg_len ? m->args[0] : 0;
+        wifi_attack_beacon(mode, 0);
+        Serial.println("BEACON SPAM laeuft (max20s)");
+        tft_show("BEACON SPAM", "laeuft (max20s)", "kein Stop-Kanal", TFT_YELLOW);
+        break;
+    }
+    case UkfeRfCmdEvilPortal:  Serial.println("CMD EVIL PORTAL (noch nicht impl.)"); break;
+    case UkfeRfCmdBleScan: {
+        uint8_t n = ble_scan(m->arg_len ? (uint32_t)m->args[0] * 1000 : 3000);
+        Serial.printf("BLE SCAN: %u Geraete\n", n);
+        char l2[24]; snprintf(l2, sizeof(l2), "%u Geraete", n);
+        tft_show("BLE SCAN", l2, "siehe Serial", TFT_CYAN);
+        break;
+    }
+    case UkfeRfCmdBleSpam: {
+        uint8_t mode = m->arg_len ? m->args[0] : 0;
+        ble_spam_start(mode);                     // BLE koexistiert mit ESP-NOW -> Abort erreicht uns
+        Serial.println("BLE SPAM laeuft");
+        tft_show("BLE SPAM", "laeuft", "Abort=stop", TFT_YELLOW);
+        break;
+    }
+    case UkfeRfCmdSourApple:
+        ble_spam_start(1);                        // Apple-only Proximity-Spam
+        tft_show("SOUR APPLE", "Apple-Spam", "Abort=stop", TFT_YELLOW);
+        break;
+    case UkfeRfCmdBleSniff:  Serial.println("BLE SNIFF (noch nicht impl.)"); break;
+    case UkfeRfCmdHidDucky: {
+        uint8_t sid = m->arg_len ? m->args[0] : 0;
+        if(sid >= DUCKY_SCRIPT_COUNT) { tft_show("HID DUCKY", "id unbekannt", "", TFT_RED); break; }
+        tft_show("HID DUCKY", "laeuft", "-> HID tippt", TFT_YELLOW);
+        delay(300);                       // Host-Enumeration abwarten
+        ducky_run(Keyboard, DUCKY_SCRIPTS[sid]);
+        Serial.printf("HID Ducky id=%u getippt\n", sid);
+        break;
+    }
+    case UkfeRfCmdHidStream: {
+        uint8_t flags = m->arg_len ? m->args[0] : 0;
+        if(flags & 0x01) { duckyStreamLen = 0; duckyStreamOverflow = false; }  // first: reset
+        for(uint8_t i = 1; i < m->arg_len; i++) {
+            if(duckyStreamLen < sizeof(duckyStream) - 1) duckyStream[duckyStreamLen++] = (char)m->args[i];
+            else duckyStreamOverflow = true;
+        }
+        if(flags & 0x02) {                // last: tippen
+            duckyStream[duckyStreamLen] = 0;
+            tft_show("HID STREAM", duckyStreamOverflow ? "OVF -> tippt" : "-> HID tippt", "", TFT_YELLOW);
+            delay(300);
+            ducky_run(Keyboard, duckyStream);
+            Serial.printf("HID Stream getippt: %u B%s\n", duckyStreamLen, duckyStreamOverflow ? " (OVF)" : "");
+            duckyStreamLen = 0; duckyStreamOverflow = false;
+        } else {
+            Serial.printf("HID Stream gepuffert: %u B\n", duckyStreamLen);
+        }
+        break;
+    }
+    case UkfeRfCmdAbort:
+        ble_spam_stop();
+        tft_show("ABORT", "BLE-Spam gestoppt", "", TFT_GREEN);
+        break;
     default: Serial.printf("CMD 0x%02X alen=%u\n", m->cmd, m->arg_len); break;
     }
 }
@@ -135,9 +230,19 @@ void setup() {
     WiFi.disconnect();
     esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
     bool ok = (esp_now_init() == ESP_OK);
-    if(ok) esp_now_register_recv_cb(onEspNowRecv);
+    if(ok) {
+        esp_now_register_recv_cb(onEspNowRecv);
+        // Broadcast-Peer registrieren — auf ESP32-S3 noetig, damit Broadcast-Frames
+        // (der Hub funkt an FF:FF:..) ueberhaupt empfangen werden. Fehlte bisher -> Empfangs-Quirk.
+        const uint8_t BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        esp_now_peer_info_t bp = {};
+        memcpy(bp.peer_addr, BCAST, 6);
+        bp.channel = ESPNOW_CHANNEL; bp.encrypt = false;
+        esp_now_add_peer(&bp);
+    }
     // Hinweis: esp_wifi_set_ps() NICHT vor esp_now_init aufrufen -> crasht S3
     // (USB-Drop/schwarzes TFT). Power-Save-Handling später sicher nachrüsten.
+    wifi_attack_init(ESPNOW_CHANNEL);   // Kanal zum Wiederherstellen nach Angriffen
 
     Serial.printf("\nG4MEOVER LilyGo UKFE-RX bereit. ESP-NOW(Kanal %d, %s) + USB-HID.\n",
                   ESPNOW_CHANNEL, ok ? "an" : "AUS");
@@ -149,7 +254,9 @@ void setup() {
 }
 
 void loop() {
-    if(!enowFlag) { delay(2); return; }
+    wifi_attack_tick();   // laufenden WiFi-Angriff bedienen
+    ble_spam_tick();      // laufenden BLE-Spam bedienen
+    if(!enowFlag) { if(!wifi_attack_busy() && !ble_spam_active()) delay(2); return; }
     int len = enowLen;
     uint8_t frame[UKFE_RF_MAX_FRAME];
     memcpy(frame, enowBuf, len);
