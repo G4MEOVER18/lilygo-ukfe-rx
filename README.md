@@ -1,5 +1,7 @@
 # G4MEOVER LilyGo T-Dongle S3 — ESP-NOW ukfe_rf-Empfänger
 
+[![CI](https://github.com/G4MEOVER18/lilygo-ukfe-rx/actions/workflows/platformio-build.yml/badge.svg)](https://github.com/G4MEOVER18/lilygo-ukfe-rx/actions/workflows/platformio-build.yml)
+
 WiFi-Satellit des G4MEOVER-Ökosystems. Empfängt die signierten `ukfe_rf`-Befehle
 vom **WROOM-Relay** per **ESP-NOW** (2,4 GHz), verifiziert sie (keyed MAC + CRC16 +
 Rolling-Counter) und führt sie aus. Die Stärke des ESP32-S3: **natives USB-HID** —
